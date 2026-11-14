@@ -1,0 +1,15 @@
+{
+  "// what": "Server + shared code (Express, run by Vercel's Node runtime as CommonJS).",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "noEmit": true
+  },
+  "include": ["api", "server", "shared"]
+}
