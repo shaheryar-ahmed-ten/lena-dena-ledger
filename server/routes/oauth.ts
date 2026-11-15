@@ -1,9 +1,9 @@
 // "Continue with Google": start (redirect to Google), callback (Google redirects back), and status.
 import crypto from "node:crypto";
 import { Router, type Request, type Response } from "express";
-import { checkInviteCode, currentUser, OAUTH_COOKIE, openState, sealState, startSession, sessionCookie } from "../lib/auth";
-import { authorizeUrl, callbackUrl, enabledProviders, fetchProfile, getProvider, newPkce, suggestUsername } from "../lib/oauth";
-import { createUser, findIdentity, findUser, identitiesOf, linkIdentity, type User } from "../lib/store";
+import { checkInviteCode, currentUser, encryptSecret, OAUTH_COOKIE, openState, sealState, startSession, sessionCookie, type OAuthState } from "../lib/auth";
+import { callbackUrl, DRIVE_FILE_SCOPE, enabledProviders, finishSignIn, getProvider, SignInCancelled, startSignIn, suggestUsername, type ExtraAccess } from "../lib/oauth";
+import { createUser, findIdentity, findUser, identitiesOf, linkIdentity, saveDriveToken, type User } from "../lib/store";
 import { requestOrigin } from "../middleware";
 
 const router = Router();
@@ -11,8 +11,15 @@ const router = Router();
 const stateCookie = { httpOnly: true, secure: sessionCookie.secure, sameSite: "lax" as const, path: "/api/oauth" };
 const goTo = (res: Response, path: string) => res.redirect(302, path);
 const withError = (page: string, msg: string) => `/${page}?error=${encodeURIComponent(msg)}`;
+// Where to show an error: the sign-up page, the ledger itself (already logged in), or the login page.
+const errorPage = (mode?: OAuthState["mode"]) => (mode === "signup" ? "signup" : mode === "drive" ? "" : "login");
 
-// GET /api/oauth/google/start?mode=login|signup|link[&code=INVITE]
+// Extra Google permissions asked for, per mode. Only "drive" asks for more than sign-in.
+const EXTRA_ACCESS: Partial<Record<OAuthState["mode"], ExtraAccess>> = {
+  drive: { scopes: [DRIVE_FILE_SCOPE], params: { include_granted_scopes: "true" } },
+};
+
+// GET /api/oauth/google/start?mode=login|signup|link|drive[&code=INVITE]
 router.get("/oauth/:provider/start", async (req: Request<{ provider: string }>, res) => {
   const { provider } = req.params;
   const { host, origin } = requestOrigin(req);
@@ -26,15 +33,16 @@ router.get("/oauth/:provider/start", async (req: Request<{ provider: string }>, 
   }
 
   const q = req.query as Record<string, string | undefined>;
-  const mode = q.mode === "signup" || q.mode === "link" ? q.mode : "login";
-  const page = mode === "signup" ? "signup" : "login";
+  const mode: OAuthState["mode"] = q.mode === "signup" || q.mode === "link" || q.mode === "drive" ? q.mode : "login";
+  const page = errorPage(mode);
   const p = getProvider(provider);
   if (!p) return goTo(res, withError(page, "That sign-in option isn't set up."));
 
+  // "link" (connect Google to this account) and "drive" (allow Google Drive access) need a logged-in user.
   let linkUser: string | null = null;
-  if (mode === "link") {
+  if (mode === "link" || mode === "drive") {
     const user = await currentUser(req);
-    if (!user) return goTo(res, withError("login", "Log in first, then connect another sign-in method."));
+    if (!user) return goTo(res, withError("login", mode === "link" ? "Log in first, then connect another sign-in method." : "Log in first, then import from Google Sheets."));
     linkUser = user.username.toLowerCase();
   }
   const invited = mode === "signup" && Boolean(process.env.SIGNUP_CODE) && checkInviteCode(q.code);
@@ -42,37 +50,66 @@ router.get("/oauth/:provider/start", async (req: Request<{ provider: string }>, 
     return goTo(res, withError("signup", "Enter the invite code first, then choose how to sign up."));
   }
 
-  const state = crypto.randomBytes(24).toString("base64url");
-  const { verifier, challenge } = newPkce();
+  // openid-client creates state, nonce and the PKCE pair and builds Google's URL.
+  // They are kept in a signed cookie until Google sends the browser back.
   const redirectUri = callbackUrl(origin, provider);
-  res.cookie(OAUTH_COOKIE, await sealState({ provider, state, verifier, mode, invited, linkUser, redirectUri }), { ...stateCookie, maxAge: 10 * 60 * 1000 });
-  goTo(res, authorizeUrl(provider, { state, challenge, redirectUri }));
+  let signIn;
+  try {
+    signIn = await startSignIn(provider, redirectUri, EXTRA_ACCESS[mode]);
+  } catch (e) {
+    console.error("OAuth start error:", provider, (e as Error).message);
+    return goTo(res, withError(page, `Couldn't reach ${p.name}. Please try again.`));
+  }
+  const { url, state, nonce, verifier } = signIn;
+  res.cookie(OAUTH_COOKIE, await sealState({ provider, state, nonce, verifier, mode, invited, linkUser, redirectUri }), { ...stateCookie, maxAge: 10 * 60 * 1000 });
+  goTo(res, url);
 });
 
 // GET /api/oauth/google/callback?code=…&state=…   (Google sends the browser here)
 router.get("/oauth/:provider/callback", async (req: Request<{ provider: string }>, res) => {
   const { provider } = req.params;
-  const q = req.query as Record<string, string | undefined>;
   const st = await openState(req.cookies?.[OAUTH_COOKIE]);
   res.clearCookie(OAUTH_COOKIE, stateCookie); // single use, whatever happens next
-  const page = st?.mode === "signup" ? "signup" : "login";
+  const page = errorPage(st?.mode);
   const p = getProvider(provider);
   if (!p) return goTo(res, withError(page, "That sign-in option isn't set up."));
 
-  // The state must match the one stored before going to Google (stops forged logins).
-  const sent = String(q.state || "");
-  if (!st || st.provider !== provider || sent.length !== st.state.length || !crypto.timingSafeEqual(Buffer.from(sent), Buffer.from(st.state))) {
+  // No valid cookie means this browser didn't start this sign-in (or it's older than 10 minutes).
+  if (!st || st.provider !== provider) {
     return goTo(res, withError("login", "That sign-in took too long or came from somewhere else. Please try again."));
   }
-  if (q.error) return goTo(res, withError(page, `Sign-in with ${p.name} was cancelled.`));
-  if (!q.code) return goTo(res, withError(page, `${p.name} didn't send a sign-in code. Please try again.`));
+
+  // The address Google sent the browser to: the registered callback plus Google's query string.
+  // Rebuilt from the sealed redirectUri so it is exact behind Vercel's proxy.
+  const current = new URL(st.redirectUri);
+  current.search = req.originalUrl.split("?")[1] || "";
 
   let prof;
   try {
-    prof = await fetchProfile(provider, { code: q.code, verifier: st.verifier, redirectUri: st.redirectUri });
+    // openid-client checks state, exchanges the code (client_secret + PKCE) and validates the ID token.
+    prof = await finishSignIn(provider, current, { state: st.state, nonce: st.nonce, verifier: st.verifier });
   } catch (e) {
-    console.error("OAuth error:", provider, (e as Error).message);
-    return goTo(res, withError(page, `Couldn't sign in with ${p.name}. Please try again.`));
+    const drive = st.mode === "drive";
+    if (e instanceof SignInCancelled) return goTo(res, withError(page, drive ? "Google Drive access was cancelled." : `Sign-in with ${p.name} was cancelled.`));
+    const err = e as Error & { cause?: { message?: string } };
+    console.error("OAuth error:", provider, err.message, err.cause?.message ? `(${err.cause.message})` : "");
+    return goTo(res, withError(page, drive ? "Couldn't get access to Google Drive. Please try again." : `Couldn't sign in with ${p.name}. Please try again.`));
+  }
+
+  // Allowing Google Drive access for "Import from Google Sheets". This doesn't sign anyone in or link
+  // accounts: any Google account the user picks is fine, it only decides whose Drive files they can pick.
+  if (st.mode === "drive") {
+    const user = await currentUser(req);
+    if (!user || user.username.toLowerCase() !== st.linkUser) return goTo(res, withError("login", "Log in again, then import from Google Sheets."));
+    if (!prof.grant.scopes.includes(DRIVE_FILE_SCOPE)) {
+      return goTo(res, withError("", "To import a sheet, tick the Google Drive box on Google's screen. Only the files you pick are shared."));
+    }
+    await saveDriveToken(user.id, {
+      token: await encryptSecret(prof.grant.accessToken),
+      scope: prof.grant.scopes.join(" "),
+      expiresAt: Date.now() + prof.grant.expiresIn * 1000,
+    });
+    return goTo(res, "/?import=sheets");
   }
 
   const linked = await findIdentity(provider, prof.sub);

@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { KINDS, balances, personKey } from "../../../shared/ledger";
 import type { Entry, EntryInput, Kind, Provider } from "../../../shared/types";
 import { api, fmt, today } from "../api";
+import SheetImport from "../components/SheetImport";
 import VoiceEntry from "../components/VoiceEntry";
 
 const shortDate = (iso: string) => {
@@ -42,6 +43,8 @@ export default function LedgerPage({ username }: { username: string }) {
   const [legacyPass, setLegacyPass] = useState("");
   const [legacyMsg, setLegacyMsg] = useState<Msg>(NONE);
   const [signin, setSignin] = useState<{ providers: Provider[]; connected?: string[]; hasPassword?: boolean } | null>(null);
+  // Back from allowing Google Drive access: open the sheet picker straight away (read before the URL is tidied).
+  const [importOnLoad] = useState(() => new URLSearchParams(window.location.search).get("import") === "sheets");
   const personRef = useRef<HTMLInputElement>(null);
   const armTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
 
@@ -319,6 +322,8 @@ export default function LedgerPage({ username }: { username: string }) {
           </ul>
         </section>
       </div>
+
+      <SheetImport autoStart={importOnLoad} onImported={load} />
 
       {signin && signin.providers.length > 0 && (
         <section className="panel" aria-labelledby="signin-h">

@@ -11,12 +11,15 @@
     "start": "vite build && tsx server/index.ts",
     "typecheck": "tsc -p tsconfig.json && tsc -p client/tsconfig.json"
   },
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@upstash/redis": "^1.35.0",
     "cookie-parser": "^1.4.7",
     "express": "^5.1.0",
-    "multer": "^2.0.0"
+    "multer": "^2.0.0",
+    "openid-client": "^6.8.8"
   },
   "devDependencies": {
     "@types/cookie-parser": "^1.4.8",

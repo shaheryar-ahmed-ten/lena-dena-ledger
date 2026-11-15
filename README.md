@@ -1,6 +1,6 @@
 # Lena Dena Ledger
 
-A money ledger for you and your friends: who owes you, who you owe, per-person balances, one-tap "settle up", edit/delete, voice entry (Whisper + AI), CSV export, accounts with Google sign-in.
+A money ledger for you and your friends: who owes you, who you owe, per-person balances, one-tap "settle up", edit/delete, voice entry (Whisper + AI), CSV export, import from Google Sheets, accounts with Google sign-in.
 
 **Stack:** React 19 (Vite) frontend · Express 5 API · TypeScript everywhere · Upstash Redis · deployed on Vercel.
 
@@ -19,8 +19,8 @@ server/                  Express API
   app.ts                 creates the app, mounts routes, error handler
   index.ts               local server (npm run dev / npm start)
   middleware.ts          requireUser, request origin helper
-  routes/                auth, entries (+ CSV), dictionary, voice (parse/transcribe), legacy, oauth
-  lib/                   store (Redis), auth (passwords, cookies), oauth (Google), ai, stt (Whisper), models
+  routes/                auth, entries (+ CSV), dictionary, voice (parse/transcribe), legacy, oauth, google (Sheets import)
+  lib/                   store (Redis), auth (passwords, cookies, token encryption), oauth (Google, via openid-client), sheets, ai, stt (Whisper), models
 shared/                  code used by BOTH sides
   types.ts               Entry, Draft, WordPair…
   ledger.ts              entry kinds, balances, validation
@@ -34,6 +34,7 @@ vercel.json              build settings + routing (/api/* → Express, everythin
 - **Pages** (`/`, `/login`, `/signup`, `/privacy`): Vercel serves `dist/index.html`; React Router picks the page in the browser. `App.tsx` calls `GET /api/me` to see who's logged in.
 - **API** (`/api/...`): `vercel.json` rewrites every `/api/*` request to the `api/index.ts` function, which is the Express app. Express matches the route (`server/routes/*`), checks the session cookie (`requireUser`), and reads/writes Redis (`server/lib/store.ts`).
 - **Google sign-in**: the button is a normal link to `/api/oauth/google/start`; Express redirects to Google; Google redirects back to `/api/oauth/google/callback`; Express sets the session cookie and redirects to `/`.
+- **Import from Google Sheets**: the same Google round trip with `mode=drive` asks for one extra permission (`drive.file`: only files the user picks). Google's Picker runs in the page; Express reads the picked sheet with the Sheets API and saves the rows the user confirms. See [docs/google-sheets-import.md](docs/google-sheets-import.md).
 
 ## Run it on your computer
 
@@ -70,6 +71,7 @@ npx vercel --prod
 | `KV_REST_API_URL`, `KV_REST_API_TOKEN` | Yes, on Vercel | Added automatically when you connect Upstash Redis |
 | `APP_URL` | For Google sign-in | Your main address, e.g. `https://lena-dena-ledger.vercel.app` |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | For Google sign-in | From Google Auth Platform → Clients |
+| `GOOGLE_API_KEY`, `GOOGLE_PROJECT_NUMBER` | For importing from Google Sheets | A browser API key for the Google Picker, and the Cloud project number (see below) |
 | `GROQ_API_KEY` | For AI + accurate speech | Free key from console.groq.com/keys |
 | `SIGNUP_CODE` | No | If set, people need this invite code to sign up |
 | `SESSION_SECRET` | No | Signs login cookies; generated and stored in Redis if unset |
@@ -78,12 +80,23 @@ npx vercel --prod
 
 Google needs this redirect URI registered: `https://lena-dena-ledger.vercel.app/api/oauth/google/callback`.
 
+### Import from Google Sheets (optional)
+
+Uses the same Google client as sign-in. The panel appears only when both variables below are set. In the same Google Cloud project:
+
+1. **APIs & Services → Library:** enable **Google Drive API**, **Google Sheets API** and **Google Picker API**.
+2. **APIs & Services → Credentials → Create credentials → API key.** Restrict it to the *Google Picker API*, and to the websites `http://localhost:5173/*` and `https://lena-dena-ledger.vercel.app/*`. Put it in `GOOGLE_API_KEY`.
+3. **Project number** (Cloud console home → Project info) → `GOOGLE_PROJECT_NUMBER`.
+4. **Google Auth Platform → Data Access → Add or remove scopes:** add `https://www.googleapis.com/auth/drive.file`. It's a non-sensitive scope, so Google needs no extra review.
+
+How it works is described in [docs/google-sheets-import.md](docs/google-sheets-import.md).
+
 ## Accounts and security
 
 - Passwords: scrypt with a random salt per user. Sessions: an HMAC-signed, httpOnly cookie (`ledger_session`, 30 days).
 - Every API route that touches data uses the user ID from the verified cookie, so users can't read or change each other's ledgers.
 - 10 wrong passwords lock a username for 15 minutes. Each user gets 100 voice/AI requests per hour.
-- Google sign-in uses state + PKCE, carried in a signed 10-minute cookie (`ledger_oauth`, path `/api/oauth`). Accounts are linked by Google's permanent user ID, never by email.
+- Google sign-in uses OpenID Connect via the [`openid-client`](https://github.com/panva/openid-client) library: state + nonce + PKCE, with the ID token validated (issuer, audience, expiry, nonce). These values are carried in a signed 10-minute cookie (`ledger_oauth`, path `/api/oauth`). Accounts are linked by Google's permanent user ID (`sub`), never by email.
 
 ## How balances work
 

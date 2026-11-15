@@ -167,3 +167,14 @@ select:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 .methods li{display:flex;justify-content:space-between;align-items:center;padding:8px 2px;border-bottom:1px solid var(--line)}
 .methods li:last-child{border-bottom:0}
 a.btn.mini{font-size:12px;padding:4px 10px}
+
+/* Import from Google Sheets: actions row and the review table (scrolls inside its box on small screens). */
+.sheet-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.sheet-table{overflow:auto;max-height:420px;border:1px solid var(--line);border-radius:8px}
+.sheet-table table{border-collapse:collapse;width:100%;font-size:14px}
+.sheet-table th,.sheet-table td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+.sheet-table th{position:sticky;top:0;background:var(--bg);font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:600;white-space:nowrap}
+.sheet-table tr:last-child td{border-bottom:0}
+.sheet-table td.num{white-space:nowrap}
+.sheet-table tr.bad td{color:var(--pay)}
+.sheet-table tr.dup td{color:var(--muted)}

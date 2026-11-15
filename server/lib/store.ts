@@ -53,6 +53,15 @@ const kv = {
     if (redis) await redis.set(key, value);
     else mem.s.set(key, value);
   },
+  /** Set a value that disappears after `seconds`. */
+  async setex(key: string, value: string, seconds: number) {
+    if (redis) await redis.set(key, value, { ex: seconds });
+    else { mem.s.set(key, value); mem.exp.set(key, Date.now() + seconds * 1000); }
+  },
+  async del(key: string) {
+    if (redis) await redis.del(key);
+    else { mem.s.delete(key); mem.exp.delete(key); }
+  },
   async setnx(key: string, value: string): Promise<boolean> {
     if (redis) return (await redis.set(key, value, { nx: true })) === "OK";
     if (mem.s.has(key)) return false;
@@ -132,6 +141,29 @@ export async function getDictionary(uid: string): Promise<WordPair[]> {
 export async function setDictionary(uid: string, pairs: WordPair[]): Promise<WordPair[]> {
   await kv.set(dictKey(uid), JSON.stringify(pairs));
   return pairs;
+}
+
+// ---- Google Drive access for "Import from Google Sheets" ----
+// Only a short-lived access token (about an hour), stored encrypted; the key expires with it.
+// No refresh token is kept, so the app can't reach Drive when the user isn't using it.
+export interface DriveToken {
+  token: string; // encrypted with encryptSecret()
+  scope: string; // what Google actually granted
+  expiresAt: number; // ms since epoch
+}
+const driveKey = (uid: string) => `u:${uid}:google-drive`;
+
+export async function saveDriveToken(uid: string, t: DriveToken) {
+  const seconds = Math.max(1, Math.floor((t.expiresAt - Date.now()) / 1000));
+  await kv.setex(driveKey(uid), JSON.stringify(t), seconds);
+}
+
+export async function getDriveToken(uid: string): Promise<DriveToken | null> {
+  return parse<DriveToken>(await kv.get(driveKey(uid)));
+}
+
+export async function deleteDriveToken(uid: string) {
+  await kv.del(driveKey(uid));
 }
 
 // ---- the old single-user ledger (passcode version), claimable once ----

@@ -1,20 +1,22 @@
-// Sign in with Google (OAuth 2.0 authorization-code flow with PKCE).
+// Sign in with Google using the `openid-client` library (OpenID Connect: authorization code + PKCE).
+// The library does the protocol work: discovery, state/nonce/PKCE values, the Google URL,
+// the code-for-token exchange and ID-token validation. This file adapts it to the app.
 // The button appears only when GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are set.
-import crypto from "node:crypto";
 import type { Provider } from "../../shared/types";
 
-type Headers = Record<string, string>;
+// openid-client is an ES module and this server is compiled as CommonJS, so it's loaded with import().
+type Oidc = typeof import("openid-client");
+type Configuration = import("openid-client").Configuration;
+let lib: Promise<Oidc> | null = null;
+const oidc = () => (lib ??= import("openid-client"));
 
 interface ProviderConfig {
   name: string;
+  issuer: string; // OpenID Connect issuer; its /.well-known/openid-configuration lists the endpoints
   id: () => string | undefined;
   secret: () => string | undefined;
-  authorize: string;
-  token: string;
   scope: string;
-  pkce: boolean;
   extra?: Record<string, string>;
-  profile: (token: string, headers: (t: string) => Headers) => Promise<Profile>;
 }
 
 export interface Profile {
@@ -28,33 +30,17 @@ export interface Profile {
 const PROVIDERS: Record<string, ProviderConfig> = {
   google: {
     name: "Google",
+    issuer: "https://accounts.google.com",
     id: () => process.env.GOOGLE_CLIENT_ID,
     secret: () => process.env.GOOGLE_CLIENT_SECRET,
-    authorize: "https://accounts.google.com/o/oauth2/v2/auth",
-    token: "https://oauth2.googleapis.com/token",
     scope: "openid email profile",
-    pkce: true,
     extra: { prompt: "select_account" },
-    async profile(tok, h) {
-      const u = (await getJson("https://openidconnect.googleapis.com/v1/userinfo", h(tok))) as { sub: string; name?: string; email?: string };
-      return { sub: u.sub, name: u.name, email: u.email };
-    },
   },
 };
 
-// For local testing only: send every provider call to a mock server. Never used on a Vercel production deploy.
+// For local testing only: the issuer URL of a local OpenID Connect test server, used instead of
+// the real provider (plain http allowed). Never used on a Vercel production deploy.
 const MOCK = process.env.VERCEL_ENV === "production" ? "" : process.env.OAUTH_TEST_MOCK_URL || "";
-function url(u: string): string {
-  if (!MOCK) return u;
-  const x = new URL(u);
-  return `${MOCK.replace(/\/$/, "")}/${x.hostname}${x.pathname}${x.search}`;
-}
-
-async function getJson(u: string, headers: Headers): Promise<unknown> {
-  const res = await fetch(url(u), { headers });
-  if (!res.ok) throw new Error(`Profile request failed (${res.status})`);
-  return res.json();
-}
 
 /** Providers whose keys are set (shown as buttons). */
 export function enabledProviders(): Provider[] {
@@ -73,49 +59,116 @@ export function callbackUrl(origin: string, key: string): string {
   return `${base.replace(/\/$/, "")}/api/oauth/${key}/callback`;
 }
 
-export function newPkce() {
-  const verifier = crypto.randomBytes(32).toString("base64url");
-  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
-  return { verifier, challenge };
+// Discovery fetches the provider's endpoints and keys once, then is reused while this server instance is warm.
+const configs = new Map<string, Promise<Configuration>>();
+function providerConfig(key: string): Promise<Configuration> {
+  let config = configs.get(key);
+  if (!config) {
+    config = (async () => {
+      const client = await oidc();
+      const p = PROVIDERS[key];
+      const issuer = new URL(MOCK || p.issuer);
+      const options = MOCK ? { execute: [client.allowInsecureRequests] } : undefined;
+      return client.discovery(issuer, p.id() || "", p.secret() || "", undefined, options); // client_secret_post
+    })();
+    config.catch(() => configs.delete(key)); // a failed lookup is retried on the next sign-in
+    configs.set(key, config);
+  }
+  return config;
 }
 
-export function authorizeUrl(key: string, opts: { state: string; challenge: string; redirectUri: string }): string {
+/** Google's "only the specific Drive files you use with this app" permission (per-file, non-sensitive). */
+export const DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+
+/** Extra permissions asked for on top of sign-in (incremental authorization). */
+export interface ExtraAccess {
+  scopes?: string[];
+  params?: Record<string, string>;
+}
+
+/** Everything the callback will need to check, plus the URL to send the browser to. */
+export interface SignInStart {
+  url: string;
+  state: string;
+  nonce: string;
+  verifier: string;
+}
+
+/** Step 1: create fresh state, nonce and PKCE values and build the provider's sign-in URL. */
+export async function startSignIn(key: string, redirectUri: string, extra: ExtraAccess = {}): Promise<SignInStart> {
+  const client = await oidc();
+  const config = await providerConfig(key);
   const p = PROVIDERS[key];
-  const q = new URLSearchParams({
-    client_id: p.id() || "",
-    redirect_uri: opts.redirectUri,
-    response_type: "code",
-    scope: p.scope,
-    state: opts.state,
-    ...(p.pkce ? { code_challenge: opts.challenge, code_challenge_method: "S256" } : {}),
+  const verifier = client.randomPKCECodeVerifier();
+  const state = client.randomState();
+  const nonce = client.randomNonce();
+  const url = client.buildAuthorizationUrl(config, {
+    redirect_uri: redirectUri,
+    scope: [p.scope, ...(extra.scopes || [])].join(" "),
+    state,
+    nonce,
+    code_challenge: await client.calculatePKCECodeChallenge(verifier),
+    code_challenge_method: "S256",
     ...(p.extra || {}),
+    ...(extra.params || {}),
   });
-  const base = url(p.authorize);
-  return `${base}${base.includes("?") ? "&" : "?"}${q}`;
+  return { url: url.href, state, nonce, verifier };
 }
 
-/** Swap the one-time code for a token, then read who the person is. */
-export async function fetchProfile(key: string, opts: { code: string; verifier: string; redirectUri: string }): Promise<Profile & { provider: string }> {
-  const p = PROVIDERS[key];
-  const params: Record<string, string> = {
-    client_id: p.id() || "",
-    client_secret: p.secret() || "",
-    code: opts.code,
-    redirect_uri: opts.redirectUri,
-    grant_type: "authorization_code",
-    ...(p.pkce ? { code_verifier: opts.verifier } : {}),
+/** The person pressed Cancel (or the provider refused) on the provider's page. */
+export class SignInCancelled extends Error {}
+
+/** What the provider granted: used only when extra permissions were asked for. */
+export interface Grant {
+  accessToken: string;
+  expiresIn: number; // seconds
+  scopes: string[];
+}
+
+/**
+ * Step 2: check the provider's reply and find out who signed in.
+ * `currentUrl` must be the callback address exactly as registered, plus the query the provider sent;
+ * the library sends that address (without the query) as redirect_uri when exchanging the code.
+ */
+export async function finishSignIn(
+  key: string,
+  currentUrl: URL,
+  checks: { state: string; nonce: string; verifier: string },
+): Promise<Profile & { provider: string; grant: Grant }> {
+  const client = await oidc();
+  const config = await providerConfig(key);
+  let tokens;
+  try {
+    // Checks issuer and state, exchanges the code with client_secret + PKCE verifier,
+    // then validates the ID token (issuer, audience = our client ID, expiry, nonce).
+    tokens = await client.authorizationCodeGrant(config, currentUrl, {
+      expectedState: checks.state,
+      expectedNonce: checks.nonce,
+      pkceCodeVerifier: checks.verifier,
+      idTokenExpected: true,
+    });
+  } catch (e) {
+    if (e instanceof client.AuthorizationResponseError) throw new SignInCancelled(e.error);
+    throw e;
+  }
+
+  const claims = tokens.claims();
+  if (!claims?.sub) throw new Error(`${PROVIDERS[key].name} didn't say who you are.`);
+  let name = typeof claims.name === "string" ? claims.name : undefined;
+  let email = typeof claims.email === "string" ? claims.email : undefined;
+  if (!name && !email) {
+    // Not in the ID token: ask the UserInfo endpoint (the library checks it is the same `sub`).
+    const info = await client.fetchUserInfo(config, tokens.access_token, claims.sub);
+    name = typeof info.name === "string" ? info.name : undefined;
+    email = typeof info.email === "string" ? info.email : undefined;
+  }
+  // The user can untick permissions on the consent screen, so report what was actually granted.
+  const grant: Grant = {
+    accessToken: tokens.access_token,
+    expiresIn: tokens.expiresIn() ?? 3600,
+    scopes: (tokens.scope || "").split(" ").filter(Boolean),
   };
-  const res = await fetch(url(p.token), {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
-    body: new URLSearchParams(params),
-  });
-  const tok = (await res.json().catch(() => ({}))) as { access_token?: string; error?: any; error_description?: string };
-  if (!res.ok || !tok.access_token) throw new Error(tok.error_description || tok.error?.message || tok.error || `Sign-in with ${p.name} failed.`);
-  const headers = (t: string): Headers => ({ Authorization: `Bearer ${t}`, Accept: "application/json", "User-Agent": "lena-dena-ledger" });
-  const prof = await p.profile(tok.access_token, headers);
-  if (!prof.sub) throw new Error(`${p.name} didn't say who you are.`);
-  return { ...prof, provider: key };
+  return { sub: claims.sub, name, email, provider: key, grant };
 }
 
 /** A readable, valid username suggestion from the profile ("alice.k@gmail.com" -> "alice.k"). */

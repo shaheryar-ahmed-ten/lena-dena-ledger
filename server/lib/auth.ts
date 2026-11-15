@@ -94,6 +94,32 @@ export function checkPassword(p: unknown): { value: string } | { error: string }
   return { value: pass };
 }
 
+// ---- encryption for secrets kept in the database (Google access tokens) ----
+// AES-256-GCM with a key derived from the session secret, so no extra setting is needed.
+// Signing (above) stops tampering; encryption also stops anyone reading the database from using the token.
+async function encryptionKey(): Promise<Buffer> {
+  return Buffer.from(crypto.hkdfSync("sha256", await secret(), "lena-dena-ledger", "stored-token-encryption", 32));
+}
+
+export async function encryptSecret(plain: string): Promise<string> {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", await encryptionKey(), iv);
+  const data = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
+  return [iv, cipher.getAuthTag(), data].map(b => b.toString("base64url")).join(".");
+}
+
+/** The original text, or null if it was changed or encrypted with a different secret. */
+export async function decryptSecret(sealed: string): Promise<string | null> {
+  try {
+    const [iv, tag, data] = sealed.split(".").map(s => Buffer.from(s, "base64url"));
+    const decipher = crypto.createDecipheriv("aes-256-gcm", await encryptionKey(), iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8");
+  } catch {
+    return null;
+  }
+}
+
 export function checkInviteCode(code: unknown): boolean {
   const need = process.env.SIGNUP_CODE;
   return !need || String(code || "").trim() === need;
@@ -103,10 +129,11 @@ export function checkInviteCode(code: unknown): boolean {
 export interface OAuthState {
   provider: string;
   state: string;
+  nonce: string;
   verifier: string;
-  mode: "login" | "signup" | "link";
+  mode: "login" | "signup" | "link" | "drive";
   invited: boolean;
-  linkUser: string | null;
+  linkUser: string | null; // the logged-in user who started a "link" or "drive" round trip
   redirectUri: string;
   exp?: number;
 }

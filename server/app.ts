@@ -10,6 +10,7 @@ import dictionaryRoutes from "./routes/dictionary";
 import voiceRoutes from "./routes/voice";
 import legacyRoutes from "./routes/legacy";
 import oauthRoutes from "./routes/oauth";
+import googleRoutes from "./routes/google";
 
 const app = express();
 app.set("trust proxy", true); // behind Vercel's proxy: use the real protocol and host
@@ -18,7 +19,7 @@ app.use(cookieParser());
 app.use(express.json({ limit: "100kb" }));
 
 const api = express.Router();
-api.use(authRoutes, entryRoutes, dictionaryRoutes, voiceRoutes, legacyRoutes, oauthRoutes);
+api.use(authRoutes, entryRoutes, dictionaryRoutes, voiceRoutes, legacyRoutes, oauthRoutes, googleRoutes);
 api.use((_req, res) => void res.status(404).json({ error: "Not found." }));
 app.use("/api", api);
 

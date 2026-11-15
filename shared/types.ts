@@ -40,3 +40,17 @@ export interface Provider {
   key: string;
   name: string;
 }
+
+/** One data row of a Google Sheet being imported (`line` is the row number shown in Sheets). */
+export interface ImportRow {
+  line: number;
+  entry?: EntryInput;
+  error?: string;
+  duplicate?: boolean; // already in the ledger
+}
+
+export interface ImportPreview {
+  title: string; // spreadsheet name
+  sheetName: string; // the tab that was read (always the first one)
+  rows: ImportRow[];
+}
